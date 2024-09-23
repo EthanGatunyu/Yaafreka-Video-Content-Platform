@@ -87,80 +87,126 @@ module yaafreka::platform {
     //==============================================================================================
     // User Account Management (Decentralized Identity - DID)
     //==============================================================================================
-    /// Register a user profile (Decentralized Identity) on the platform
     public entry fun register_user(
-        name: string::String, 
-        bio: string::String, 
-        preferences: string::String, 
-        ctx: &mut TxContext
-    ) {
-        let wallet = sender(ctx);
-        let profile = UserProfile {
-            id: new(ctx),
-            wallet,
-            name,
-            bio,
-            preferences,
-            access_granted: false,
-        };
-        transfer::transfer(profile, wallet);
-    }
+    name: string::String, 
+    bio: string::String, 
+    preferences: string::String, 
+    ctx: &mut TxContext
+) {
+    let wallet = sender(ctx);
+
+    // Check if the user profile already exists
+    assert!(UserProfile::exists(wallet) == false, EProfileAlreadyExists);
+
+    // Create a new user profile
+    let profile = UserProfile {
+        id: new(ctx),
+        wallet,
+        name,
+        bio,
+        preferences,
+        access_granted: false,
+    };
+
+    // Transfer ownership of the profile to the user's wallet
+    transfer::transfer(profile, wallet);
+}
+
 
     //==============================================================================================
     // Content Upload (Video NFTs)
     //==============================================================================================
     /// Mint a new Video NFT for every video uploaded
     public entry fun upload_video(
-        title: string::String, 
-        description: string::String, 
-        url: string::String, 
-        price: u64, 
-        ctx: &mut TxContext
-    ) {
-        let creator = sender(ctx);
-        let video_nft = VideoNFT {
-            id: new(ctx),
-            title,
-            description,
-            url,
-            creator,
-            ownership: creator,
-            price,
-            is_for_sale: true,
-        };
-        transfer::transfer(video_nft, creator);
-    }
+    title: string::String, 
+    description: string::String, 
+    url: string::String, 
+    price: u64, 
+    ctx: &mut TxContext
+) {
+    let creator = sender(ctx);
+
+    // Validate the URL field
+    assert!(!string::is_empty(&url), EInvalidURL);
+    assert!(string::starts_with(&url, "http://") || string::starts_with(&url, "https://"), EInvalidURLFormat);
+
+    // Create a new VideoNFT
+    let video_nft = VideoNFT {
+        id: new(ctx),
+        title,
+        description,
+        url,
+        creator,
+        ownership: creator,
+        price,
+        is_for_sale: true,
+    };
+
+    // Transfer ownership of the VideoNFT to the creator
+    transfer::transfer(video_nft, creator);
+}
+
 
     //==============================================================================================
     // Decentralized Video Streaming
     //==============================================================================================
-    /// Stream video using decentralized payment channels
     public entry fun stream_video(
-        nft: &VideoNFT, 
-        _viewer: address, 
-        payment: Coin<SUI>, 
-        _ctx: &mut TxContext
-    ) {
-        assert!(nft.is_for_sale == true, EInvalidAccess);
-        transfer::public_transfer(payment, nft.creator);
+    nft: &VideoNFT, 
+    viewer: address, 
+    subscriptions: vector<Subscription>, // A vector of active subscriptions
+    ctx: &mut TxContext
+) {
+    // Ensure the video is for sale or the viewer has purchased it
+    let has_purchased = nft.ownership == viewer;
+    assert!(has_purchased || nft.is_for_sale == false, EInvalidAccess);
+
+    // Check if the viewer has a valid subscription to the creator
+    let mut has_valid_subscription = false;
+    let current_time = sui::clock::now(ctx); // Get the current timestamp
+
+    // Loop through the subscriptions to check if the viewer is subscribed to the creator
+    let creator = nft.creator;
+    for subscription in &subscriptions {
+        if subscription.subscriber == viewer && subscription.creator == creator && subscription.expiration_time > current_time {
+            has_valid_subscription = true;
+            break;
+        }
     }
+
+    // Ensure the viewer either purchased the video or has a valid subscription
+    assert!(has_purchased || has_valid_subscription, EInvalidSubscriptionOrPurchase);
+
+    // Stream the video (proceed with the streaming logic)
+    // Emit an event for tracking purposes
+    event::emit(viewer, creator, nft.url);
+}
+
 
     //==============================================================================================
     // Revenue Sharing (Creator Royalties)
     //==============================================================================================
-    /// Distribute revenue between the creator and platform
     public entry fun distribute_revenue(
-        cap: &mut TreasuryCap<SUI>, 
-        amount: u64, 
-        creator: address, 
-        platform: address, 
-        ctx: &mut TxContext
-    ) {
-        let creator_share = (amount * 90) / 100;
-        let platform_share = amount - creator_share;
-        transfer::public_transfer(mint(cap, creator_share, ctx), creator);
-        transfer::public_transfer(mint(cap, platform_share, ctx), platform);
-    }
+    cap: &mut TreasuryCap<SUI>, 
+    amount: u64, 
+    creator: address, 
+    platform: address, 
+    ctx: &mut TxContext
+) {
+    // Ensure the total amount to be distributed is not zero
+    assert!(amount > 0, EInvalidAmount);
+
+    // Calculate the shares
+    let platform_share = amount / 10; // 10% for the platform
+    let creator_share = amount - platform_share; // Remaining 90% for the creator
+
+    // Validate shares
+    assert!(creator_share >= 0, EInvalidShare);
+    assert!(platform_share >= 0, EInvalidShare);
+
+    // Transfer the shares
+    transfer::public_transfer(mint(cap, creator_share, ctx), creator);
+    transfer::public_transfer(mint(cap, platform_share, ctx), platform);
+}
 
     //==============================================================================================
     // Ad-Free Subscription Model
@@ -281,15 +327,30 @@ module yaafreka::platform {
     //==============================================================================================
     /// Lock video behind a paywall for pay-per-view access
     public entry fun pay_for_video(
-        nft: &mut VideoNFT, 
-        _viewer: address, 
-        cap: &mut TreasuryCap<SUI>, 
-        ctx: &mut TxContext
-    ) {
-        let payment = mint(cap, nft.price, ctx);
-        transfer::public_transfer(payment, nft.creator);
-        nft.is_for_sale = false;
-    }
+    nft: &mut VideoNFT, 
+    viewer: address, 
+    cap: &mut TreasuryCap<SUI>, 
+    ctx: &mut TxContext
+) {
+    // Ensure the video is still for sale
+    assert!(nft.is_for_sale, EVideoNotForSale);
+
+    // Check if the video price is valid (greater than 0)
+    assert!(nft.price > 0, EInvalidPrice);
+
+    // Mint the payment coin for the video price
+    let payment = mint(cap, nft.price, ctx);
+
+    // Transfer the payment to the video creator
+    transfer::public_transfer(payment, nft.creator);
+
+    // Transfer ownership of the NFT to the viewer
+    nft.ownership = viewer;
+
+    // Mark the video as no longer for sale
+    nft.is_for_sale = false;
+}
+
 
     //==============================================================================================
     // Peer-to-Peer Content Sharing (Referral System)
